@@ -1,0 +1,206 @@
+name: IPA File Tree
+
+# Save as: .github/workflows/ipa-file-tree.yml
+# Run it from the Actions tab (workflow_dispatch) or it runs automatically
+# whenever you publish a release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (leave empty for the latest release)"
+        required: false
+        default: ""
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  tree:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download .ipa from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          mkdir -p ipa
+          if [ -n "$TAG" ]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "*.ipa" --dir ipa
+          else
+            gh release download --repo "$GITHUB_REPOSITORY" --pattern "*.ipa" --dir ipa
+          fi
+          ls -la ipa
+
+      - name: Install tree
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tree
+
+      - name: Write tree generator
+        run: |
+          cat > tree.py <<'PY'
+          import os, sys, html
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          outdir = Path(sys.argv[2])
+          label = sys.argv[3]
+          outdir.mkdir(parents=True, exist_ok=True)
+
+          txt = [label + "/"]
+          flat = []
+          page = []
+          stats = dict(dirs=0, files=0, links=0, hidden=0, max_depth=0)
+
+
+          def entries(d):
+              with os.scandir(d) as it:
+                  items = list(it)
+              items.sort(key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+              return items
+
+
+          def walk(d, prefix, depth, rel):
+              items = entries(d)
+              for i, e in enumerate(items):
+                  last = i == len(items) - 1
+                  name = e.name
+                  relpath = f"{rel}/{name}" if rel else name
+                  parent = rel if rel else "."
+                  hidden = name.startswith(".")
+                  is_link = e.is_symlink()
+                  is_dir = e.is_dir(follow_symlinks=False)
+                  ext = "" if is_dir else os.path.splitext(name)[1]
+                  kind = "LINK" if is_link else ("DIR" if is_dir else "FILE")
+                  target = os.readlink(e.path) if is_link else ""
+
+                  stats["max_depth"] = max(stats["max_depth"], depth)
+                  if hidden:
+                      stats["hidden"] += 1
+                  if is_link:
+                      stats["links"] += 1
+                  elif is_dir:
+                      stats["dirs"] += 1
+                  else:
+                      stats["files"] += 1
+
+                  shown = name + ("/" if is_dir else "") + (f" -> {target}" if is_link else "")
+                  txt.append(prefix + ("└── " if last else "├── ") + shown)
+                  flat.append(
+                      f"{kind:<4} | depth={depth} | hidden={'yes' if hidden else 'no'} "
+                      f"| ext={ext or '-'} | parent={parent} | name={name} | path={relpath}"
+                      + (f" | target={target}" if is_link else "")
+                  )
+
+                  badges = ""
+                  if hidden:
+                      badges += '<span class="b hid">dot</span>'
+                  if ext:
+                      badges += f'<span class="b ext">{html.escape(ext)}</span>'
+                  if is_link:
+                      badges += f'<span class="b lnk">&rarr; {html.escape(target)}</span>'
+                  esc_name = html.escape(name)
+                  esc_parent = html.escape(parent + "/")
+                  esc_path = html.escape(relpath.lower(), quote=True)
+
+                  if is_dir and not is_link:
+                      count = len(os.listdir(e.path))
+                      page.append(
+                          f'<details data-p="{esc_path}"><summary>'
+                          f'<span class="n d">{esc_name}/</span>{badges}'
+                          f'<span class="par">parent: {esc_parent}</span>'
+                          f'<span class="cnt">{count} items</span></summary><div class="ch">'
+                      )
+                      walk(e.path, prefix + ("    " if last else "│   "), depth + 1, relpath)
+                      page.append("</div></details>")
+                  else:
+                      page.append(
+                          f'<div class="f" data-p="{esc_path}">'
+                          f'<span class="n">{esc_name}</span>{badges}'
+                          f'<span class="par">parent: {esc_parent}</span></div>'
+                      )
+
+
+          walk(str(root), "", 1, "")
+
+          summary = (
+              f"{stats['dirs']} directories, {stats['files']} files, {stats['links']} symlinks, "
+              f"{stats['hidden']} dot-prefixed entries, max depth {stats['max_depth']}"
+          )
+
+          (outdir / "tree.txt").write_text(
+              f"# File tree of {label}.ipa\n# {summary}\n\n" + "\n".join(txt) + "\n",
+              encoding="utf-8",
+          )
+          (outdir / "flat-list.txt").write_text(
+              f"# Flat listing of {label}.ipa (one line per entry, with parent + dot flag)\n"
+              f"# {summary}\n\n" + "\n".join(flat) + "\n",
+              encoding="utf-8",
+          )
+
+          css = """
+          :root{--bg:#fff;--fg:#1a1a1a;--dim:#777;--line:#ddd;--acc:#2563eb}
+          @media(prefers-color-scheme:dark){:root{--bg:#111;--fg:#e8e8e8;--dim:#8a8a8a;--line:#333;--acc:#6ea8ff}}
+          body{background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0;padding:24px}
+          h1{font-size:18px;margin:0 0 4px}.sum{color:var(--dim);margin-bottom:12px}
+          input{width:100%;max-width:420px;padding:8px;border:1px solid var(--line);background:transparent;color:inherit;border-radius:6px;margin-bottom:12px}
+          button{padding:6px 10px;margin-right:6px;border:1px solid var(--line);background:transparent;color:inherit;border-radius:6px;cursor:pointer}
+          details{margin-left:4px}.ch{margin-left:18px;border-left:1px solid var(--line);padding-left:10px}
+          summary{cursor:pointer}.f{padding-left:16px}
+          .n.d{color:var(--acc);font-weight:600}
+          .par{color:var(--dim);margin-left:12px;font-size:12px}.cnt{color:var(--dim);margin-left:8px;font-size:12px}
+          .b{font-size:11px;border:1px solid var(--line);border-radius:4px;padding:0 5px;margin-left:6px}
+          .hid{color:#d97706;border-color:#d97706}.lnk{color:#7c3aed}
+          .hide{display:none}
+          """
+          js = """
+          const q=document.getElementById('q');
+          const all=()=>document.querySelectorAll('[data-p]');
+          q.addEventListener('input',()=>{
+            const v=q.value.trim().toLowerCase();
+            document.querySelectorAll('.f').forEach(el=>el.classList.toggle('hide',v&&!el.dataset.p.includes(v)));
+            document.querySelectorAll('details').forEach(d=>{
+              const has=d.querySelector('.f:not(.hide)');
+              d.classList.toggle('hide',v&&!has&&!d.dataset.p.includes(v));
+              if(v)d.open=true;
+            });
+          });
+          document.getElementById('ex').onclick=()=>document.querySelectorAll('details').forEach(d=>d.open=true);
+          document.getElementById('co').onclick=()=>document.querySelectorAll('details').forEach(d=>d.open=false);
+          """
+          doc = (
+              "<!doctype html><html><head><meta charset='utf-8'>"
+              f"<title>{html.escape(label)} file tree</title><style>{css}</style></head><body>"
+              f"<h1>{html.escape(label)}.ipa</h1><div class='sum'>{summary}</div>"
+              "<input id='q' placeholder='filter by name or path (e.g. .plist, Frameworks, .DS_Store)'>"
+              "<div><button id='ex'>Expand all</button><button id='co'>Collapse all</button></div>"
+              + "".join(page)
+              + f"<script>{js}</script></body></html>"
+          )
+          (outdir / "tree.html").write_text(doc, encoding="utf-8")
+          print(f"{label}: {summary}")
+          PY
+
+      - name: Extract and build file trees
+        run: |
+          shopt -s nullglob
+          for ipa in ipa/*; do
+            base="$(basename "$ipa" .ipa)"
+            mkdir -p "extracted/$base" "out/$base"
+
+            # Raw zip entries exactly as stored in the archive
+            unzip -Z1 "$ipa" > "out/$base/raw-zip-entries.txt"
+
+            # Extract and build trees
+            unzip -q "$ipa" -d "extracted/$base"
+            tree -a -F --noreport --charset=ascii "extracted/$base" > "out/$base/tree-gnu.txt" || true
+            python3 tree.py "extracted/$base" "out/$base" "$base"
+          done
+          find out -type f | sort
+
+      - name: Upload trees
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-file-tree
+          path: out/
